@@ -57,31 +57,19 @@ fn parse_aliases(alias_output: &str) -> Vec<String> {
         .collect()
 }
 
-// Runs a command and returns the environment variables
-fn get_env() -> io::Result<HashMap<String, String>> {
-    let env_output = Command::new("bash")
-        .arg("-c")
-        .arg("env")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()?;
-
-    let env_str = String::from_utf8_lossy(&env_output.stdout);
+fn parse_env(env_str: &str) -> HashMap<String, String> {
     let mut env_map = HashMap::new();
-
     for line in env_str.lines() {
         if let Some((key, value)) = line.split_once('=') {
             env_map.insert(key.to_string(), value.to_string());
         }
     }
-
-    Ok(env_map)
+    env_map
 }
 
-fn process_env_changes(
-    new_env: &HashMap<String, String>,
-    old_env: &HashMap<String, String>,
-) -> Vec<String> {
+fn process_env_changes(old_env_str: &str, new_env_str: &str) -> Vec<String> {
+    let old_env = parse_env(old_env_str);
+    let new_env = parse_env(new_env_str);
     let mut script_lines = Vec::new();
 
     // Find added or modified environment variables
@@ -114,11 +102,46 @@ fn process_env_changes(
     script_lines
 }
 
-fn eval_and_get_new_env(command: &str) -> io::Result<(HashMap<String, String>, String)> {
-    const ALIAS_SEPARATOR: &str = "---ALIAS---";
+fn parse_funcs(func_str: &str) -> Vec<String> {
+    // "declare -f func_name" -> "func_name"
+    func_str
+        .lines()
+        .map(|line| line.split_whitespace().last().unwrap().to_string())
+        .collect()
+}
+
+fn process_func_changes(old_func_str: &str, new_func_str: &str) -> Vec<String> {
+    let old_funcs = parse_funcs(old_func_str);
+    let new_funcs = parse_funcs(new_func_str);
+    let mut script_lines = Vec::new();
+
+    // Find added functions
+    for func in new_funcs.iter() {
+        if !old_funcs.contains(func) {
+            script_lines.push(format!("# Adding function {}", func));
+            // TODO
+        }
+    }
+
+    // Find removed functions
+    for func in old_funcs.iter() {
+        if !new_funcs.contains(func) {
+            script_lines.push(format!("# Removing function {}", func));
+            // TODO
+        }
+    }
+
+    // TODO track changed definitions
+
+    script_lines
+}
+
+fn eval_and_get_new_env(command: &str) -> io::Result<(String, String, String)> {
+    // Returns raw sections: env, aliases, and functions
+    const SECTION_SEPARATOR: &str = "---SECTION---";
     let bash_script = format!(
-        "eval \"{}\" >/dev/null; env; echo '\n{}\n'; alias",
-        command, ALIAS_SEPARATOR
+        "eval \"{}\" >/dev/null; env; echo '{}'; alias; echo '{}'; declare -F",
+        command, SECTION_SEPARATOR, SECTION_SEPARATOR
     );
     let output = Command::new("bash")
         .arg("-c")
@@ -127,37 +150,42 @@ fn eval_and_get_new_env(command: &str) -> io::Result<(HashMap<String, String>, S
         .stderr(Stdio::inherit())
         .output()?;
 
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    let mut lines = output_str.lines();
-
-    let mut new_env = HashMap::new();
-    while let Some(line) = lines.next() {
-        if line == ALIAS_SEPARATOR {
-            break;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            new_env.insert(key.to_string(), value.to_string());
-        }
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Command execution failed",
+        ));
     }
 
-    let alias_str: String = lines.collect::<Vec<&str>>().join("\n");
-    Ok((new_env, alias_str))
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let sections: Vec<String> = output_str
+        .split(SECTION_SEPARATOR)
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    Ok((
+        sections[0].clone(),
+        sections[1].clone(),
+        sections[2].clone(),
+    ))
 }
 
 fn gen_script() -> io::Result<String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let command = args.join(" ");
 
-    let old_env = get_env()?;
-    let (new_env, alias_str) = eval_and_get_new_env(&command)?;
+    let (old_env_str, _, old_func_str) = eval_and_get_new_env("")?;
+    let (new_env_str, new_alias_str, new_func_str) = eval_and_get_new_env(&command)?;
 
-    let script_lines = process_env_changes(&new_env, &old_env);
-    let alias_lines = parse_aliases(&alias_str);
+    let env_lines = process_env_changes(&old_env_str, &new_env_str);
+    let alias_lines = parse_aliases(&new_alias_str);
+    let func_lines = process_func_changes(&old_func_str, &new_func_str);
 
     Ok(format!(
-        "{}\n{}",
-        script_lines.join("\n"),
-        alias_lines.join("\n")
+        "{}\n{}\n{}\n",
+        env_lines.join("\n"),
+        alias_lines.join("\n"),
+        func_lines.join("\n")
     ))
 }
 
